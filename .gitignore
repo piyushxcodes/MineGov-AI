@@ -1,0 +1,58 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+credentials/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Android
+.gradle/
+**/.gradle/
+**/build/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# React/Vite
+dist/
+.vite/
+
+# AI models / generated output
+ai-service/outputs/*
+ai-service/models/*.pt
+
+# Database / storage
+*.db
+*.sqlite
+*.sqlite3
+postgres-data/
+minio-data/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
