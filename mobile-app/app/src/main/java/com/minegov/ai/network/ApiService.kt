@@ -22,12 +22,28 @@ interface ApiService {
         @Path("violationId") violationId: String,
         @Part file: MultipartBody.Part
     ): Response<VisionAnalysisResponse>
+
+    @Multipart
+    @POST("api/v1/violations/{violationId}/voice-transcribe")
+    suspend fun transcribeViolationVoice(
+        @Path("violationId") violationId: String,
+        @Part file: MultipartBody.Part
+    ): Response<VoiceTranscriptionResponse>
+
+    @Multipart
+    @POST("api/v1/violations/{violationId}/document-upload")
+    suspend fun uploadDocument(
+        @Path("violationId") violationId: String,
+        @Part file: MultipartBody.Part
+    ): Response<DocumentUploadResponse>
 }
+
 
 data class CreateViolationResponse(
     val id: String?,
     val message: String?
 )
+
 
 data class VisionAnalysisResponse(
     val success: Boolean,
@@ -37,6 +53,7 @@ data class VisionAnalysisResponse(
     val finding: String?
 )
 
+
 data class VisionResult(
     val riskScore: Int,
     val riskLevel: String,
@@ -44,10 +61,12 @@ data class VisionResult(
     val detections: List<VisionDetection>
 )
 
+
 data class VisionViolation(
     val type: String,
     val confidence: Double
 )
+
 
 data class VisionDetection(
     val `class`: String,
@@ -55,7 +74,25 @@ data class VisionDetection(
     val box: List<Double>
 )
 
+
 data class CombinedRisk(
     val score: Int?,
     val level: String?
+)
+
+
+data class DocumentUploadResponse(
+    val success: Boolean,
+    val violationId: String,
+    val documentUri: String?,
+    val filename: String?
+)
+
+data class VoiceTranscriptionResponse(
+    val success: Boolean,
+    val violationId: String,
+    val voiceUri: String?,
+    val transcript: String?,
+    val language: String?,
+    val languageProbability: Double?
 )

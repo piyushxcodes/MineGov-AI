@@ -8,10 +8,8 @@ import java.util.concurrent.TimeUnit
 
 object ApiClient {
 
-    // Temporary development URL.
-    // Replace this when the FastAPI backend is created.
     private const val BASE_URL =
-        "http://10.235.217.43:8000/"
+        "http://127.0.0.1:8000/"
 
     private val loggingInterceptor =
         HttpLoggingInterceptor().apply {
@@ -22,8 +20,8 @@ object ApiClient {
         OkHttpClient.Builder()
             .addInterceptor(loggingInterceptor)
             .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
-            .writeTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(120, TimeUnit.SECONDS)
+            .writeTimeout(120, TimeUnit.SECONDS)
             .build()
 
     private val retrofit =

@@ -43,6 +43,7 @@ import com.minegov.ai.data.local.AppDatabase
 import com.minegov.ai.data.local.ViolationEntity
 import com.minegov.ai.location.LocationManager
 import com.minegov.ai.ocr.OcrProcessor
+import com.minegov.ai.ui.ocr.DocumentCaptureScreen
 import com.minegov.ai.sync.SyncScheduler
 import kotlinx.coroutines.launch
 
@@ -96,6 +97,10 @@ fun NewViolationScreen(
     }
 
     var voiceUri by remember {
+        mutableStateOf<String?>(null)
+    }
+
+    var documentUri by remember {
         mutableStateOf<String?>(null)
     }
 
@@ -169,8 +174,8 @@ fun NewViolationScreen(
 
     suspend fun runOcr() {
 
-        if (photoUri.isNullOrBlank()) {
-            ocrError = "Capture a document photo first."
+        if (documentUri.isNullOrBlank()) {
+            ocrError = "Scan a document first."
             return
         }
 
@@ -179,7 +184,7 @@ fun NewViolationScreen(
             isOcrProcessing = true
             ocrError = null
 
-            val uri = Uri.parse(photoUri)
+            val uri = Uri.parse(documentUri)
 
             val bitmap: Bitmap? =
                 context.contentResolver
@@ -381,6 +386,28 @@ fun NewViolationScreen(
     }
 
     // =================================================
+    // STEP 8 — DOCUMENT CAPTURE (OPTIONAL)
+    // =================================================
+
+    if (currentStep == 8) {
+        DocumentCaptureScreen(
+            onBack = {
+                currentStep = 6
+            },
+            onDocumentCaptured = { uri ->
+                documentUri = uri
+                ocrText = ""
+                ocrError = null
+                currentStep = 6
+                scope.launch {
+                    runOcr()
+                }
+            }
+        )
+        return
+    }
+
+    // =================================================
     // SUBMITTED SCREEN
     // =================================================
 
@@ -508,14 +535,13 @@ fun NewViolationScreen(
 
                 voiceUri = voiceUri,
 
+                documentUri = documentUri,
                 ocrText = ocrText,
                 isOcrProcessing = isOcrProcessing,
                 ocrError = ocrError,
 
                 onRunOcr = {
-                    scope.launch {
-                        runOcr()
-                    }
+                    currentStep = 8
                 },
 
                 onOcrTextChange = {
@@ -569,6 +595,9 @@ fun NewViolationScreen(
                 videoUri = videoUri,
 
                 voiceUri = voiceUri,
+
+                documentUri = documentUri,
+                ocrText = ocrText,
 
                 isSaving = isSaving,
 
@@ -626,6 +655,12 @@ fun NewViolationScreen(
 
                                     voiceUri =
                                         voiceUri,
+
+                                    documentUri =
+                                        documentUri,
+
+                                    ocrText =
+                                        ocrText.ifBlank { null },
 
                                     syncStatus =
                                         "PENDING"
@@ -982,6 +1017,7 @@ private fun StepDetailsScreen(
     photoUri: String?,
     videoUri: String?,
     voiceUri: String?,
+    documentUri: String?,
     ocrText: String,
     isOcrProcessing: Boolean,
     ocrError: String?,
@@ -1120,7 +1156,7 @@ private fun StepDetailsScreen(
         )
 
         Text(
-            text = "Use the captured photo to extract text from a licence, permit or inspection document.",
+            text = "Scan a separate licence, permit, certificate or inspection document. OCR runs automatically after capture.",
             color = Color.Gray,
             fontSize = 13.sp
         )
@@ -1131,7 +1167,7 @@ private fun StepDetailsScreen(
 
         Button(
             onClick = onRunOcr,
-            enabled = photoUri != null && !isOcrProcessing,
+            enabled = !isOcrProcessing,
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.buttonColors(
                 containerColor = Color.White,
@@ -1144,7 +1180,7 @@ private fun StepDetailsScreen(
                 text = if (isOcrProcessing) {
                     "SCANNING..."
                 } else {
-                    "SCAN DOCUMENT WITH OCR"
+                    if (documentUri != null) "RESCAN DOCUMENT" else "SCAN DOCUMENT WITH OCR"
                 },
                 fontWeight = FontWeight.Bold
             )
@@ -1340,6 +1376,23 @@ private fun StepDetailsScreen(
                 voiceUri != null
         )
 
+        EvidenceRow(
+            title = "Document",
+            available = documentUri != null
+        )
+
+        if (ocrText.isNotBlank()) {
+            Spacer(modifier = Modifier.height(12.dp))
+            ReviewSection(title = "OCR TEXT")
+            ReviewBox(value = ocrText)
+        }
+
+        EvidenceRow(
+            title = "Document + OCR",
+            available =
+                documentUri != null && ocrText.isNotBlank()
+        )
+
         Spacer(
             modifier = Modifier.height(25.dp)
         )
@@ -1416,6 +1469,8 @@ private fun StepReviewScreen(
     photoUri: String?,
     videoUri: String?,
     voiceUri: String?,
+    documentUri: String?,
+    ocrText: String,
     isSaving: Boolean,
     saveError: String?,
     onEdit: () -> Unit,

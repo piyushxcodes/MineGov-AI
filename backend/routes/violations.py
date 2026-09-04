@@ -1,32 +1,27 @@
 import json
 import time
 import uuid
+from pathlib import Path
+import shutil
 
-from fastapi import (
-    APIRouter,
-    Depends,
-    File,
-    HTTPException,
-    UploadFile,
-)
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 
 from database.connection import get_db
 from database.models import Violation
+from database.audit import AuditLog
+from schemas.violation import ViolationCreate
+
+from services.whisper_service import transcribe_audio
+from services.audit_service import create_audit_log
+
+from services.sla_service import get_sla_status, get_remaining_sla_ms
 
 from services.ai_service import analyze_violation
 from services.ai_vision_service import (
     analyze_image,
     build_vision_finding,
     serialize_detections,
-)
-from services.sla_service import (
-    get_sla_status,
-    get_remaining_sla_ms,
-)
-from services.escalation_service import (
-    escalation_required,
 )
 
 
@@ -37,52 +32,18 @@ router = APIRouter(
 
 
 # ============================================================
-# REQUEST MODELS
-# ============================================================
-
-class ViolationCreate(BaseModel):
-    localId: str
-    violationType: str
-    description: str
-    observedCondition: str
-    severity: str
-
-    latitude: float | None = None
-    longitude: float | None = None
-
-    photoUri: str | None = None
-    videoUri: str | None = None
-    voiceUri: str | None = None
-
-    createdAt: int
-
-
-class AssignmentRequest(BaseModel):
-    assignedTo: str
-
-
-class StatusUpdateRequest(BaseModel):
-    status: str
-
-
-# ============================================================
 # HELPERS
 # ============================================================
 
-ALLOWED_STATUSES = {
-    "SUBMITTED",
-    "ASSIGNED",
-    "IN_PROGRESS",
-    "RESOLVED",
-    "VERIFIED",
-    "CLOSED",
-}
-
-
 def violation_to_dict(violation: Violation):
-    """
-    Convert SQLAlchemy violation into API response.
-    """
+
+    detections = []
+
+    if violation.ai_detections:
+        try:
+            detections = json.loads(violation.ai_detections)
+        except Exception:
+            detections = []
 
     return {
         "id": violation.id,
@@ -100,43 +61,39 @@ def violation_to_dict(violation: Violation):
         "videoUri": violation.video_uri,
         "voiceUri": violation.voice_uri,
 
-        "status": violation.status,
+        "voiceTranscript": violation.voice_transcript,
+        "voiceLanguage": violation.voice_language,
 
+        # DOCUMENT / OCR
+        "documentUri": violation.document_uri,
+        "ocrText": violation.ocr_text,
+
+
+
+        # WORKFLOW
+        "status": violation.status,
         "assignedTo": violation.assigned_to,
         "assignedAt": violation.assigned_at,
         "slaDeadline": violation.sla_deadline,
-
         "slaStatus": get_sla_status(
-            violation.sla_deadline,
-            violation.status,
+        violation.sla_deadline
         ),
-
         "remainingSlaMs": get_remaining_sla_ms(
-            violation.sla_deadline,
-            violation.status,
+            violation.sla_deadline
         ),
 
-        "escalationRequired": escalation_required(
-            violation.sla_deadline,
-            violation.status,
-        ),
-
-        # Rule/NLP AI
+        # RULE AI
         "aiRiskScore": violation.ai_risk_score,
         "aiRiskLevel": violation.ai_risk_level,
         "aiFinding": violation.ai_finding,
         "aiConfidence": violation.ai_confidence,
 
-        # YOLO Vision AI
-        "aiDetections": (
-            json.loads(violation.ai_detections)
-            if violation.ai_detections
-            else []
-        ),
-
+        # VISION AI
+        "aiDetections": detections,
         "aiVisionFindings": violation.ai_vision_findings,
         "aiVisionScore": violation.ai_vision_score,
 
+        # TIME
         "createdAt": violation.created_at,
         "updatedAt": violation.updated_at,
     }
@@ -147,122 +104,104 @@ def violation_to_dict(violation: Violation):
 # ============================================================
 
 @router.post("")
-def create_violation(
-    payload: ViolationCreate,
+async def create_violation(
+    request: ViolationCreate,
     db: Session = Depends(get_db),
 ):
 
     # --------------------------------------------------------
-    # Prevent duplicate offline sync
+    # DUPLICATE PROTECTION
     # --------------------------------------------------------
 
     existing = (
         db.query(Violation)
-        .filter(Violation.local_id == payload.localId)
+        .filter(Violation.local_id == request.local_id)
         .first()
     )
 
     if existing:
-
         return {
             "id": existing.id,
             "message": "Violation already exists",
-            "duplicate": True,
-
-            "aiRiskScore": existing.ai_risk_score,
-            "aiRiskLevel": existing.ai_risk_level,
-            "aiFinding": existing.ai_finding,
-            "aiConfidence": existing.ai_confidence,
-
-            "aiDetections": (
-                json.loads(existing.ai_detections)
-                if existing.ai_detections
-                else []
-            ),
-
-            "aiVisionFindings": existing.ai_vision_findings,
-            "aiVisionScore": existing.ai_vision_score,
         }
 
+    now = int(time.time() * 1000)
+    violation_id = str(uuid.uuid4())
+
     # --------------------------------------------------------
-    # AI Risk Analysis
+    # RULE-BASED AI
     # --------------------------------------------------------
 
     ai_result = analyze_violation(
-        violation_type=payload.violationType,
-        severity=payload.severity,
-        description=payload.description,
-        observed_condition=payload.observedCondition,
-
-        has_photo=bool(payload.photoUri),
-        has_video=bool(payload.videoUri),
-        has_voice=bool(payload.voiceUri),
-
+        violation_type=request.violation_type,
+        severity=request.severity,
+        description=request.description,
+        observed_condition=request.observed_condition or "",
+        has_photo=request.photo_uri is not None,
+        has_video=request.video_uri is not None,
+        has_voice=request.voice_uri is not None,
         has_gps=(
-            payload.latitude is not None
-            and payload.longitude is not None
+            request.latitude is not None
+            and request.longitude is not None
         ),
     )
 
-    # --------------------------------------------------------
-    # Create database object
-    # --------------------------------------------------------
-
     violation = Violation(
+        id=violation_id,
+        local_id=request.local_id,
 
-        id=f"VIO-{uuid.uuid4().hex[:8].upper()}",
+        violation_type=request.violation_type,
+        description=request.description,
+        observed_condition=request.observed_condition,
+        severity=request.severity,
 
-        local_id=payload.localId,
+        latitude=request.latitude,
+        longitude=request.longitude,
 
-        violation_type=payload.violationType,
-        description=payload.description,
-        observed_condition=payload.observedCondition,
-        severity=payload.severity.upper(),
+        photo_uri=request.photo_uri,
+        video_uri=request.video_uri,
+        voice_uri=request.voice_uri,
 
-        latitude=payload.latitude,
-        longitude=payload.longitude,
+        # DOCUMENT / OCR
+        document_uri=request.document_uri,
+        ocr_text=request.ocr_text,
 
-        photo_uri=payload.photoUri,
-        video_uri=payload.videoUri,
-        voice_uri=payload.voiceUri,
-
+        # WORKFLOW
         status="SUBMITTED",
 
-        assigned_to=None,
-        assigned_at=None,
-        sla_deadline=None,
+        # RULE AI
+        ai_risk_score=ai_result.get("riskScore"),
+        ai_risk_level=ai_result.get("riskLevel"),
+        ai_finding=ai_result.get("finding"),
+        ai_confidence=ai_result.get("confidence"),
 
-        # AI Risk
-        ai_risk_score=ai_result["riskScore"],
-        ai_risk_level=ai_result["riskLevel"],
-        ai_finding=ai_result["finding"],
-        ai_confidence=ai_result["confidence"],
-
-        # AI Vision
-        ai_detections=None,
-        ai_vision_findings=None,
-        ai_vision_score=None,
-
-        created_at=payload.createdAt,
-        updated_at=int(time.time() * 1000),
+        created_at=request.created_at,
+        updated_at=now,
     )
 
     db.add(violation)
     db.commit()
     db.refresh(violation)
 
+    create_audit_log(
+        db=db,
+        action="VIOLATION_CREATED",
+        violation_id=violation.id,
+        actor="INSPECTOR",
+        new_status=violation.status,
+        details={
+            "violation_type": violation.violation_type,
+            "severity": violation.severity,
+        },
+    )
+
+    db.commit()
+
     return {
         "id": violation.id,
         "message": "Violation created successfully",
-
-        "aiRiskScore": violation.ai_risk_score,
-        "aiRiskLevel": violation.ai_risk_level,
-        "aiFinding": violation.ai_finding,
-        "aiConfidence": violation.ai_confidence,
-
-        "aiDetections": [],
-        "aiVisionFindings": None,
-        "aiVisionScore": None,
+        "riskScore": violation.ai_risk_score,
+        "riskLevel": violation.ai_risk_level,
     }
 
 
@@ -281,13 +220,10 @@ def get_violations(
         .all()
     )
 
-    return {
-        "count": len(violations),
-        "violations": [
-            violation_to_dict(v)
-            for v in violations
-        ],
-    }
+    return [
+        violation_to_dict(v)
+        for v in violations
+    ]
 
 
 # ============================================================
@@ -316,11 +252,11 @@ def get_violation(
 
 
 # ============================================================
-# RULE-BASED AI ANALYSIS
+# RUN RULE AI AGAIN
 # ============================================================
 
 @router.post("/{violation_id}/analyze")
-def analyze_existing_violation(
+async def analyze_existing_violation(
     violation_id: str,
     db: Session = Depends(get_db),
 ):
@@ -341,22 +277,112 @@ def analyze_existing_violation(
         violation_type=violation.violation_type,
         severity=violation.severity,
         description=violation.description,
-        observed_condition=violation.observed_condition,
-
-        has_photo=bool(violation.photo_uri),
-        has_video=bool(violation.video_uri),
-        has_voice=bool(violation.voice_uri),
-
+        observed_condition=violation.observed_condition or "",
+        has_photo=violation.photo_uri is not None,
+        has_video=violation.video_uri is not None,
+        has_voice=violation.voice_uri is not None,
         has_gps=(
             violation.latitude is not None
             and violation.longitude is not None
         ),
     )
 
-    violation.ai_risk_score = ai_result["riskScore"]
-    violation.ai_risk_level = ai_result["riskLevel"]
-    violation.ai_finding = ai_result["finding"]
-    violation.ai_confidence = ai_result["confidence"]
+    violation.ai_risk_score = ai_result.get("riskScore")
+    violation.ai_risk_level = ai_result.get("riskLevel")
+    violation.ai_finding = ai_result.get("finding")
+    violation.ai_confidence = ai_result.get("confidence")
+
+    violation.updated_at = int(time.time() * 1000)
+
+    db.commit()
+    db.refresh(violation)
+
+    return violation_to_dict(violation)
+
+
+# ============================================================
+# YOLO VISION ANALYSIS
+# ============================================================
+
+@router.post("/{violation_id}/vision-analyze")
+async def analyze_violation_vision(
+    violation_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+
+    violation = (
+        db.query(Violation)
+        .filter(Violation.id == violation_id)
+        .first()
+    )
+
+    if not violation:
+        raise HTTPException(
+            status_code=404,
+            detail="Violation not found",
+        )
+
+    image_bytes = await file.read()
+
+    if not image_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="Empty image file",
+        )
+
+    try:
+        result = await analyze_image(
+            image_bytes=image_bytes,
+            filename=file.filename or "image.jpg",
+        )
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Vision AI service failed: {error}",
+        )
+
+    # --------------------------------------------------------
+    # SAVE YOLO RESULTS
+    # --------------------------------------------------------
+
+    violation.ai_detections = serialize_detections(result)
+
+    violation.ai_vision_findings = build_vision_finding(result)
+
+    vision_score = result.get("riskScore")
+
+    violation.ai_vision_score = vision_score
+
+    # --------------------------------------------------------
+    # COMBINED RISK
+    # --------------------------------------------------------
+
+    rule_score = (
+        violation.ai_risk_score
+        if violation.ai_risk_score is not None
+        else 0
+    )
+
+    if vision_score is not None:
+
+        combined_score = max(
+            rule_score,
+            int(vision_score),
+        )
+
+        if combined_score >= 80:
+            combined_level = "CRITICAL"
+        elif combined_score >= 60:
+            combined_level = "HIGH"
+        elif combined_score >= 30:
+            combined_level = "MEDIUM"
+        else:
+            combined_level = "LOW"
+
+        violation.ai_risk_score = combined_score
+        violation.ai_risk_level = combined_level
 
     violation.updated_at = int(time.time() * 1000)
 
@@ -366,28 +392,25 @@ def analyze_existing_violation(
     return {
         "success": True,
         "violationId": violation.id,
-
-        "aiRiskScore": violation.ai_risk_score,
-        "aiRiskLevel": violation.ai_risk_level,
-        "aiFinding": violation.ai_finding,
-        "aiConfidence": violation.ai_confidence,
+        "vision": result,
+        "combinedRisk": {
+            "score": violation.ai_risk_score,
+            "level": violation.ai_risk_level,
+        },
+        "finding": violation.ai_vision_findings,
     }
 
 
 # ============================================================
-# YOLO AI VISION ANALYSIS
+# DOCUMENT UPLOAD
 # ============================================================
 
-@router.post("/{violation_id}/vision-analyze")
-async def vision_analyze_violation(
+@router.post("/{violation_id}/document-upload")
+async def upload_document(
     violation_id: str,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-
-    # --------------------------------------------------------
-    # Find violation
-    # --------------------------------------------------------
 
     violation = (
         db.query(Violation)
@@ -401,206 +424,64 @@ async def vision_analyze_violation(
             detail="Violation not found",
         )
 
-    # --------------------------------------------------------
-    # Validate image
-    # --------------------------------------------------------
+    document_bytes = await file.read()
 
-    allowed_types = {
-        "image/jpeg",
-        "image/png",
-        "image/webp",
-    }
-
-    if file.content_type not in allowed_types:
-
+    if not document_bytes:
         raise HTTPException(
             status_code=400,
-            detail="Only JPEG, PNG and WebP images are supported.",
+            detail="Empty document file",
         )
 
-    image_bytes = await file.read()
+    storage_dir = Path("storage/evidence")
+    storage_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    if not image_bytes:
+    extension = Path(
+        file.filename or ""
+    ).suffix.lower()
 
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded image is empty.",
-        )
+    if not extension:
+        extension = ".jpg"
 
-    # --------------------------------------------------------
-    # Call YOLO AI Service
-    # --------------------------------------------------------
+    filename = f"{uuid.uuid4()}{extension}"
+
+    file_path = storage_dir / filename
 
     try:
 
-        result = await analyze_image(
-            image_bytes,
-            file.filename or "evidence.jpg",
+        with file_path.open("wb") as buffer:
+            buffer.write(document_bytes)
+
+        document_uri = f"/evidence/{filename}"
+
+        violation.document_uri = document_uri
+        violation.updated_at = int(
+            time.time() * 1000
         )
 
-    except Exception as exc:
+        db.commit()
+        db.refresh(violation)
+
+        return {
+            "success": True,
+            "violationId": violation.id,
+            "documentUri": document_uri,
+            "filename": filename,
+        }
+
+    except Exception as error:
+
+        if file_path.exists():
+            file_path.unlink()
+
+        db.rollback()
 
         raise HTTPException(
-            status_code=502,
-            detail=f"AI Vision Service unavailable: {str(exc)}",
+            status_code=500,
+            detail=f"Document upload failed: {error}",
         )
-
-    # --------------------------------------------------------
-    # Extract YOLO result
-    # --------------------------------------------------------
-
-    vision_score = int(
-        result.get("riskScore", 0)
-    )
-
-    vision_level = result.get(
-        "riskLevel",
-        "LOW",
-    )
-
-    detections = result.get(
-        "detections",
-        [],
-    )
-
-    vision_violations = result.get(
-        "violations",
-        [],
-    )
-
-    # --------------------------------------------------------
-    # Combine existing Risk Engine + YOLO
-    # --------------------------------------------------------
-
-    existing_score = (
-        violation.ai_risk_score
-        if violation.ai_risk_score is not None
-        else 0
-    )
-
-    combined_score = max(
-        existing_score,
-        vision_score,
-    )
-
-    if combined_score >= 80:
-
-        combined_level = "CRITICAL"
-
-    elif combined_score >= 60:
-
-        combined_level = "HIGH"
-
-    elif combined_score >= 35:
-
-        combined_level = "MEDIUM"
-
-    else:
-
-        combined_level = "LOW"
-
-    # --------------------------------------------------------
-    # Generate vision finding
-    # --------------------------------------------------------
-
-    vision_finding = build_vision_finding(
-        result
-    )
-
-    # --------------------------------------------------------
-    # Store YOLO detections
-    # --------------------------------------------------------
-
-    violation.ai_detections = serialize_detections(
-        result
-    )
-
-    violation.ai_vision_findings = (
-        vision_finding
-    )
-
-    violation.ai_vision_score = (
-        vision_score
-    )
-
-    # --------------------------------------------------------
-    # Update combined AI risk
-    # --------------------------------------------------------
-
-    violation.ai_risk_score = (
-        combined_score
-    )
-
-    violation.ai_risk_level = (
-        combined_level
-    )
-
-    # --------------------------------------------------------
-    # Combine findings
-    # --------------------------------------------------------
-
-    if vision_finding:
-
-        existing_finding = (
-            violation.ai_finding or ""
-        )
-
-        if existing_finding:
-
-            violation.ai_finding = (
-                existing_finding
-                + " "
-                + vision_finding
-            )
-
-        else:
-
-            violation.ai_finding = (
-                vision_finding
-            )
-
-    # --------------------------------------------------------
-    # Update timestamp
-    # --------------------------------------------------------
-
-    violation.updated_at = int(
-        time.time() * 1000
-    )
-
-    db.commit()
-    db.refresh(violation)
-
-    # --------------------------------------------------------
-    # Response
-    # --------------------------------------------------------
-
-    return {
-
-        "success": True,
-
-        "violationId": violation.id,
-
-        "vision": {
-
-            "riskScore": vision_score,
-
-            "riskLevel": vision_level,
-
-            "violations": vision_violations,
-
-            "detections": detections,
-        },
-
-        "combinedRisk": {
-
-            "score": violation.ai_risk_score,
-
-            "level": violation.ai_risk_level,
-        },
-
-        "finding": violation.ai_finding,
-
-    }
 
 
 # ============================================================
@@ -610,7 +491,7 @@ async def vision_analyze_violation(
 @router.patch("/{violation_id}/assign")
 def assign_violation(
     violation_id: str,
-    payload: AssignmentRequest,
+    assigned_to: str,
     db: Session = Depends(get_db),
 ):
 
@@ -626,71 +507,89 @@ def assign_violation(
             detail="Violation not found",
         )
 
-    if not payload.assignedTo.strip():
-
-        raise HTTPException(
-            status_code=400,
-            detail="assignedTo cannot be empty",
-        )
-
     now = int(time.time() * 1000)
 
-    violation.assigned_to = (
-        payload.assignedTo.strip()
-    )
-
-    violation.assigned_at = now
-
-    # --------------------------------------------------------
-    # SLA
-    # --------------------------------------------------------
-    # Severity-based SLA window
-    # CRITICAL = 4 hours
-    # HIGH     = 8 hours
-    # MEDIUM   = 24 hours
-    # LOW      = 48 hours
-    # --------------------------------------------------------
-
     sla_hours = {
-
         "CRITICAL": 4,
         "HIGH": 8,
         "MEDIUM": 24,
         "LOW": 48,
-
     }
 
     hours = sla_hours.get(
         violation.severity.upper(),
-        24,
+        48,
     )
+
+    violation.assigned_to = assigned_to
+    violation.assigned_at = now
 
     violation.sla_deadline = (
         now + hours * 60 * 60 * 1000
     )
 
-    if violation.status == "SUBMITTED":
-
-        violation.status = "ASSIGNED"
-
+    violation.status = "ASSIGNED"
     violation.updated_at = now
 
     db.commit()
     db.refresh(violation)
 
-    return violation_to_dict(
-        violation
+    create_audit_log(
+        db=db,
+        action="ASSIGNED",
+        violation_id=violation.id,
+        actor="SUPERVISOR",
+        new_status=violation.status,
+        details={
+            "assigned_to": violation.assigned_to,
+            "sla_deadline": violation.sla_deadline,
+        },
     )
+
+    db.commit()
+
+    return violation_to_dict(violation)
 
 
 # ============================================================
 # UPDATE STATUS
 # ============================================================
 
-@router.patch("/{violation_id}/status")
-def update_violation_status(
+@router.get("/{violation_id}/audit")
+def get_violation_audit(
     violation_id: str,
-    payload: StatusUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    violation = db.query(Violation).filter(Violation.id == violation_id).first()
+    if not violation:
+        raise HTTPException(status_code=404, detail="Violation not found")
+    logs = (
+        db.query(AuditLog)
+        .filter(AuditLog.violation_id == violation_id)
+        .order_by(AuditLog.timestamp.asc())
+        .all()
+    )
+    return [
+        {
+            "id": log.id,
+            "violationId": log.violation_id,
+            "action": log.action,
+            "actor": log.actor,
+            "oldStatus": log.old_status,
+            "newStatus": log.new_status,
+            "details": log.details,
+            "timestamp": log.timestamp,
+            "previousHash": log.previous_hash,
+            "currentHash": log.current_hash,
+        }
+        for log in logs
+    ]
+
+
+@router.patch("/{violation_id}/status")
+def update_status(
+    violation_id: str,
+    status: str,
     db: Session = Depends(get_db),
 ):
 
@@ -706,20 +605,27 @@ def update_violation_status(
             detail="Violation not found",
         )
 
-    new_status = payload.status.upper()
+    allowed_statuses = {
+        "SUBMITTED",
+        "ASSIGNED",
+        "IN_PROGRESS",
+        "RESOLVED",
+        "VERIFIED",
+        "CLOSED",
+        "ESCALATED",
+    }
 
-    if new_status not in ALLOWED_STATUSES:
+    status = status.upper()
 
+    if status not in allowed_statuses:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Invalid status. Allowed values: "
-                + ", ".join(sorted(ALLOWED_STATUSES))
-            ),
+            detail="Invalid status",
         )
 
-    violation.status = new_status
+    old_status = violation.status
 
+    violation.status = status
     violation.updated_at = int(
         time.time() * 1000
     )
@@ -727,6 +633,138 @@ def update_violation_status(
     db.commit()
     db.refresh(violation)
 
-    return violation_to_dict(
-        violation
+    create_audit_log(
+        db=db,
+        action="STATUS_CHANGED",
+        violation_id=violation.id,
+        actor="SUPERVISOR",
+        old_status=old_status,
+        new_status=violation.status,
+        details={
+            "status_change": f"{old_status} -> {violation.status}",
+        },
     )
+
+    db.commit()
+
+    return violation_to_dict(violation)
+
+
+@router.patch("/{violation_id}/verify")
+def verify_violation(
+    violation_id: str,
+    db: Session = Depends(get_db),
+):
+    violation = (
+        db.query(Violation)
+        .filter(Violation.id == violation_id)
+        .first()
+    )
+
+    if not violation:
+        raise HTTPException(
+            status_code=404,
+            detail="Violation not found",
+        )
+
+    if violation.status != "RESOLVED":
+        raise HTTPException(
+            status_code=400,
+            detail="Only RESOLVED violations can be verified",
+        )
+
+    now = int(time.time() * 1000)
+    old_status = violation.status
+
+    violation.status = "VERIFIED"
+    violation.updated_at = now
+
+    db.commit()
+    db.refresh(violation)
+
+    create_audit_log(
+        db=db,
+        action="VERIFIED",
+        violation_id=violation.id,
+        actor="INSPECTOR",
+        old_status=old_status,
+        new_status="VERIFIED",
+        details={
+            "verification": "Inspector verification completed",
+        },
+    )
+
+    db.commit()
+
+    return violation_to_dict(violation)
+
+@router.post("/{violation_id}/voice-transcribe")
+async def transcribe_violation_voice(
+    violation_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    violation = (
+        db.query(Violation)
+        .filter(Violation.id == violation_id)
+        .first()
+    )
+
+    if not violation:
+        raise HTTPException(
+            status_code=404,
+            detail="Violation not found"
+        )
+
+    audio_bytes = await file.read()
+
+    if not audio_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="Empty audio file"
+        )
+
+    storage_dir = Path("storage/evidence")
+    storage_dir.mkdir(parents=True, exist_ok=True)
+
+    extension = Path(file.filename or "").suffix.lower()
+
+    if not extension:
+        extension = ".m4a"
+
+    filename = f"{uuid.uuid4()}{extension}"
+    file_path = storage_dir / filename
+
+    try:
+        with file_path.open("wb") as buffer:
+            buffer.write(audio_bytes)
+
+        result = transcribe_audio(str(file_path))
+
+        violation.voice_uri = f"/evidence/{filename}"
+        violation.voice_transcript = result["text"]
+        violation.voice_language = result["language"]
+        violation.updated_at = int(time.time() * 1000)
+
+        db.commit()
+        db.refresh(violation)
+
+        return {
+            "success": True,
+            "violationId": violation.id,
+            "voiceUri": violation.voice_uri,
+            "transcript": violation.voice_transcript,
+            "language": violation.voice_language,
+            "languageProbability": result["languageProbability"],
+        }
+
+    except Exception as error:
+        if file_path.exists():
+            file_path.unlink()
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Voice transcription failed: {error}"
+        )

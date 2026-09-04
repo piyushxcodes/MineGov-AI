@@ -1,6 +1,5 @@
 package com.minegov.ai.sync
 
-import android.content.Context
 import android.net.Uri
 import android.util.Log
 import androidx.work.CoroutineWorker
@@ -11,14 +10,12 @@ import com.minegov.ai.network.model.ViolationRequest
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.File
 
 class ViolationSyncWorker(
-    appContext: Context,
+    appContext: android.content.Context,
     workerParams: WorkerParameters
-) : CoroutineWorker(
-    appContext,
-    workerParams
-) {
+) : CoroutineWorker(appContext, workerParams) {
 
     override suspend fun doWork(): Result {
 
@@ -35,7 +32,6 @@ class ViolationSyncWorker(
         )
 
         if (pendingViolations.isEmpty()) {
-            Log.d("ViolationSyncWorker", "Nothing to sync")
             return Result.success()
         }
 
@@ -49,7 +45,7 @@ class ViolationSyncWorker(
                 )
 
                 // ---------------------------------------------------------
-                // STEP 1: SEND VIOLATION METADATA
+                // 1. CREATE VIOLATION
                 // ---------------------------------------------------------
 
                 val request = ViolationRequest(
@@ -63,71 +59,235 @@ class ViolationSyncWorker(
                     photoUri = violation.photoUri,
                     videoUri = violation.videoUri,
                     voiceUri = violation.voiceUri,
+                    documentUri = violation.documentUri,
+                    ocrText = violation.ocrText,
                     createdAt = violation.createdAt
                 )
 
                 val response =
                     ApiClient.apiService.createViolation(request)
 
-                Log.d(
-                    "ViolationSyncWorker",
-                    "Server response: ${response.code()}"
-                )
-
                 if (!response.isSuccessful) {
 
-                    val failedViolation = violation.copy(
-                        syncStatus = "FAILED",
-                        syncAttempts = violation.syncAttempts + 1,
-                        updatedAt = System.currentTimeMillis(),
-                        lastSyncError = "HTTP ${response.code()}"
-                    )
-
-                    dao.update(failedViolation)
-
-                    Log.e(
-                        "ViolationSyncWorker",
-                        "SYNC FAILED: HTTP ${response.code()}"
+                    dao.update(
+                        violation.copy(
+                            syncStatus = "FAILED",
+                            syncAttempts = violation.syncAttempts + 1,
+                            updatedAt = System.currentTimeMillis(),
+                            lastSyncError = "HTTP ${response.code()}"
+                        )
                     )
 
                     return Result.retry()
                 }
 
-                // ---------------------------------------------------------
-                // STEP 2: GET SERVER VIOLATION ID
-                // ---------------------------------------------------------
-
-                val serverId = response.body()?.id
-
-                if (serverId.isNullOrBlank()) {
-
-                    Log.e(
-                        "ViolationSyncWorker",
-                        "Server returned no violation ID"
-                    )
-
-                    val failedViolation = violation.copy(
-                        syncStatus = "FAILED",
-                        syncAttempts = violation.syncAttempts + 1,
-                        updatedAt = System.currentTimeMillis(),
-                        lastSyncError = "Server returned no violation ID"
-                    )
-
-                    dao.update(failedViolation)
-
-                    return Result.retry()
-                }
+                val serverId =
+                    response.body()?.id
+                        ?: throw Exception(
+                            "Server returned no violation ID"
+                        )
 
                 Log.d(
                     "ViolationSyncWorker",
-                    "SERVER VIOLATION ID: $serverId"
+                    "Violation created: $serverId"
                 )
 
                 // ---------------------------------------------------------
-                // STEP 3: UPLOAD PHOTO TO AI VISION
+                // 2. VOICE → WHISPER
+                // ---------------------------------------------------------
+
+                var voiceError: String? = null
+
+                if (!violation.voiceUri.isNullOrBlank()) {
+
+                    try {
+
+                        Log.d(
+                            "ViolationSyncWorker",
+                            "Uploading voice for Whisper..."
+                        )
+
+                        val voicePath = violation.voiceUri
+
+                        // VoiceNoteScreen stores a real local filesystem path.
+                        // Therefore ContentResolver cannot read it.
+                        val audioFile = File(voicePath)
+
+                        if (!audioFile.exists()) {
+                            throw Exception(
+                                "Voice file not found: $voicePath"
+                            )
+                        }
+
+                        val audioBytes = audioFile.readBytes()
+
+                        if (audioBytes.isEmpty()) {
+                            throw Exception(
+                                "Voice file is empty"
+                            )
+                        }
+
+                        Log.d(
+                            "ViolationSyncWorker",
+                            "Voice file size: ${audioBytes.size} bytes"
+                        )
+
+                        val mimeType = "audio/mp4"
+
+                        val body =
+                            audioBytes.toRequestBody(
+                                mimeType.toMediaType()
+                            )
+
+                        val filePart =
+                            MultipartBody.Part.createFormData(
+                                name = "file",
+                                filename =
+                                    "voice_${violation.localId}.m4a",
+                                body = body
+                            )
+
+                        val voiceResponse =
+                            ApiClient.apiService
+                                .transcribeViolationVoice(
+                                    violationId = serverId,
+                                    file = filePart
+                                )
+
+                        if (voiceResponse.isSuccessful) {
+
+                            val result =
+                                voiceResponse.body()
+
+                            Log.d(
+                                "ViolationSyncWorker",
+                                "WHISPER SUCCESS"
+                            )
+
+                            Log.d(
+                                "ViolationSyncWorker",
+                                "Language: ${result?.language}"
+                            )
+
+                            Log.d(
+                                "ViolationSyncWorker",
+                                "Transcript: ${result?.transcript}"
+                            )
+
+                            Log.d(
+                                "ViolationSyncWorker",
+                                "Probability: ${result?.languageProbability}"
+                            )
+
+                        } else {
+
+                            voiceError =
+                                "Voice HTTP ${voiceResponse.code()}"
+
+                            Log.e(
+                                "ViolationSyncWorker",
+                                voiceError
+                            )
+                        }
+
+                    } catch (e: Exception) {
+
+                        voiceError =
+                            e.message
+                                ?: "Voice transcription error"
+
+                        Log.e(
+                            "ViolationSyncWorker",
+                            "WHISPER ERROR: $voiceError",
+                            e
+                        )
+                    }
+                }
+
+                // ---------------------------------------------------------
+                // 3. DOCUMENT UPLOAD
+                // ---------------------------------------------------------
+
+                var documentError: String? = null
+
+                if (!violation.documentUri.isNullOrBlank()) {
+
+                    try {
+
+                        val uri =
+                            Uri.parse(violation.documentUri)
+
+                        val resolver =
+                            applicationContext.contentResolver
+
+                        val documentBytes =
+                            resolver.openInputStream(uri)?.use {
+                                it.readBytes()
+                            }
+
+                        if (
+                            documentBytes == null ||
+                            documentBytes.isEmpty()
+                        ) {
+                            throw Exception(
+                                "Could not read document from URI"
+                            )
+                        }
+
+                        val mimeType =
+                            resolver.getType(uri)
+                                ?: "application/octet-stream"
+
+                        val body =
+                            documentBytes.toRequestBody(
+                                mimeType.toMediaType()
+                            )
+
+                        val part =
+                            MultipartBody.Part.createFormData(
+                                name = "file",
+                                filename =
+                                    "document_${violation.localId}",
+                                body = body
+                            )
+
+                        val documentResponse =
+                            ApiClient.apiService.uploadDocument(
+                                violationId = serverId,
+                                file = part
+                            )
+
+                        if (!documentResponse.isSuccessful) {
+
+                            documentError =
+                                "Document HTTP ${documentResponse.code()}"
+                        }
+
+                    } catch (e: Exception) {
+
+                        documentError =
+                            e.message
+                                ?: "Document upload error"
+
+                        Log.e(
+                            "ViolationSyncWorker",
+                            "DOCUMENT UPLOAD ERROR: $documentError",
+                            e
+                        )
+                    }
+                }
+
+                // ---------------------------------------------------------
+                // 4. PHOTO → YOLO
                 // ---------------------------------------------------------
 
                 var visionError: String? = null
+
+                // IMPORTANT DIAGNOSTIC
+                Log.d(
+                    "ViolationSyncWorker",
+                    "PHOTO URI: ${violation.photoUri}"
+                )
 
                 if (!violation.photoUri.isNullOrBlank()) {
 
@@ -135,29 +295,49 @@ class ViolationSyncWorker(
 
                         Log.d(
                             "ViolationSyncWorker",
-                            "Preparing photo for YOLO: ${violation.photoUri}"
+                            "PHOTO URI IS PRESENT - starting YOLO upload"
                         )
 
-                        val uri = Uri.parse(violation.photoUri)
+                        val uri =
+                            Uri.parse(violation.photoUri)
 
-                        val resolver = applicationContext.contentResolver
+                        val resolver =
+                            applicationContext.contentResolver
 
-                        val imageBytes = resolver
-                            .openInputStream(uri)
-                            ?.use { inputStream ->
-                                inputStream.readBytes()
+                        Log.d(
+                            "ViolationSyncWorker",
+                            "Reading photo from URI: $uri"
+                        )
+
+                        val imageBytes =
+                            resolver.openInputStream(uri)?.use {
+                                it.readBytes()
                             }
 
-                        if (imageBytes == null || imageBytes.isEmpty()) {
-
-                            throw Exception("Could not read photo from URI")
+                        if (
+                            imageBytes == null ||
+                            imageBytes.isEmpty()
+                        ) {
+                            throw Exception(
+                                "Could not read photo from URI"
+                            )
                         }
+
+                        Log.d(
+                            "ViolationSyncWorker",
+                            "Photo file size: ${imageBytes.size} bytes"
+                        )
 
                         val mimeType =
                             resolver.getType(uri)
                                 ?: "image/jpeg"
 
-                        val requestBody =
+                        Log.d(
+                            "ViolationSyncWorker",
+                            "Photo MIME type: $mimeType"
+                        )
+
+                        val body =
                             imageBytes.toRequestBody(
                                 mimeType.toMediaType()
                             )
@@ -165,25 +345,22 @@ class ViolationSyncWorker(
                         val filePart =
                             MultipartBody.Part.createFormData(
                                 name = "file",
-                                filename = "evidence_${violation.localId}.jpg",
-                                body = requestBody
+                                filename =
+                                    "evidence_${violation.localId}.jpg",
+                                body = body
                             )
 
                         Log.d(
                             "ViolationSyncWorker",
-                            "Uploading photo to YOLO..."
+                            "Uploading photo to Vision..."
                         )
 
                         val visionResponse =
-                            ApiClient.apiService.analyzeViolationVision(
-                                violationId = serverId,
-                                file = filePart
-                            )
-
-                        Log.d(
-                            "ViolationSyncWorker",
-                            "YOLO response: ${visionResponse.code()}"
-                        )
+                            ApiClient.apiService
+                                .analyzeViolationVision(
+                                    violationId = serverId,
+                                    file = filePart
+                                )
 
                         if (visionResponse.isSuccessful) {
 
@@ -222,68 +399,64 @@ class ViolationSyncWorker(
 
                             Log.e(
                                 "ViolationSyncWorker",
-                                "YOLO ANALYSIS FAILED: HTTP ${visionResponse.code()}"
+                                "YOLO ANALYSIS ERROR: $visionError"
                             )
                         }
 
                     } catch (e: Exception) {
 
                         visionError =
-                            e.message ?: "Vision analysis error"
+                            e.message
+                                ?: "Vision analysis error"
 
                         Log.e(
                             "ViolationSyncWorker",
-                            "YOLO ANALYSIS ERROR: ${e.message}",
+                            "YOLO ANALYSIS ERROR: $visionError",
                             e
                         )
                     }
 
                 } else {
 
-                    Log.d(
+                    Log.e(
                         "ViolationSyncWorker",
-                        "No photo attached. Skipping YOLO."
+                        "PHOTO URI IS NULL OR BLANK - YOLO SKIPPED"
                     )
                 }
 
                 // ---------------------------------------------------------
-                // STEP 4: MARK LOCAL VIOLATION AS SYNCED
+                // 5. FINAL LOCAL SYNC STATUS
                 // ---------------------------------------------------------
 
-                val syncedViolation = violation.copy(
-                    syncStatus = "SYNCED",
-                    serverId = serverId,
-                    updatedAt = System.currentTimeMillis(),
-                    lastSyncError = visionError
-                )
+                val errors =
+                    listOfNotNull(
+                        voiceError?.let {
+                            "Voice: $it"
+                        },
+                        documentError?.let {
+                            "Document: $it"
+                        },
+                        visionError?.let {
+                            "Vision: $it"
+                        }
+                    )
 
-                dao.update(syncedViolation)
+                dao.update(
+                    violation.copy(
+                        syncStatus = "SYNCED",
+                        serverId = serverId,
+                        updatedAt = System.currentTimeMillis(),
+                        lastSyncError =
+                            errors.joinToString("; ")
+                                .ifBlank { null }
+                    )
+                )
 
                 Log.d(
                     "ViolationSyncWorker",
                     "SYNC SUCCESS: $serverId"
                 )
-
-                if (visionError != null) {
-
-                    Log.w(
-                        "ViolationSyncWorker",
-                        "Violation synced, but YOLO failed: $visionError"
-                    )
-
-                } else {
-
-                    Log.d(
-                        "ViolationSyncWorker",
-                        "Violation + YOLO synced successfully"
-                    )
-                }
             }
-
-            Log.d(
-                "ViolationSyncWorker",
-                "WORKER FINISHED SUCCESSFULLY"
-            )
 
             Result.success()
 
@@ -297,14 +470,17 @@ class ViolationSyncWorker(
 
             for (violation in pendingViolations) {
 
-                val failedViolation = violation.copy(
-                    syncStatus = "FAILED",
-                    syncAttempts = violation.syncAttempts + 1,
-                    updatedAt = System.currentTimeMillis(),
-                    lastSyncError = e.message ?: "Network error"
+                dao.update(
+                    violation.copy(
+                        syncStatus = "FAILED",
+                        syncAttempts =
+                            violation.syncAttempts + 1,
+                        updatedAt =
+                            System.currentTimeMillis(),
+                        lastSyncError =
+                            e.message ?: "Network error"
+                    )
                 )
-
-                dao.update(failedViolation)
             }
 
             Result.retry()
