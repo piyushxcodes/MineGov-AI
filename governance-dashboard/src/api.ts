@@ -51,7 +51,7 @@ export interface AuditLog {
   currentHash: string;
 }
 
-const API_BASE_URL = "http://127.0.0.1:8000";
+const API_BASE_URL = "http://minegov-backend.onrender.com";
 
 export async function getViolations(): Promise<Violation[]> {
   const response = await fetch(
